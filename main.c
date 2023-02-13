@@ -88,10 +88,10 @@ struct shm_mtx* shm_mtx_init(char* mtx_name, int flag, mode_t mode) {
     }
   }
   mtx->mtx = (pthread_mutex_t*) shm_map_data_pointer(sizeof(pthread_mutex_t), mtx->fd);
-  
-  pthread_mutexattr_setpshared(mtx->attr, PTHREAD_PROCESS_SHARED);
-  pthread_mutex_init(mtx->mtx, mtx->attr);
-
+  if (flag == CREATE_FLAG) {
+    pthread_mutexattr_setpshared(mtx->attr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(mtx->mtx, mtx->attr);
+  }
   return mtx;
 }
 
@@ -109,9 +109,10 @@ struct shm_cv* shm_cv_init(char* cv_name, int flag, mode_t mode) {
   }
   cv->cv = (pthread_cond_t*) shm_map_data_pointer(sizeof(pthread_cond_t), cv->fd);
   
-  pthread_condattr_setpshared(cv->attr, PTHREAD_PROCESS_SHARED);
-  pthread_cond_init(cv->cv, cv->attr);
-
+  if (flag == CREATE_FLAG) {
+    pthread_condattr_setpshared(cv->attr, PTHREAD_PROCESS_SHARED);
+    pthread_cond_init(cv->cv, cv->attr);
+  }
   return cv;
 }
 
