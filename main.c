@@ -130,6 +130,7 @@ struct interprocess_sync* shm_init_sync(char* cv_name, char* mtx_name, int id, i
 
 char *write_line_to_shm(struct msg_handler_args* args) {
   char *new_buf = args->data->data;
+  while(*args->data->status != WRITE) {}
   char c = getchar();
   pthread_mutex_lock(args->write_mtx->mtx);
   pthread_mutex_lock(args->sync->mtx->mtx);
@@ -139,7 +140,7 @@ char *write_line_to_shm(struct msg_handler_args* args) {
     }
     *new_buf = c;
     new_buf++;
-  } while ((c = getchar()) != '\n');
+  } while((c = getchar()) != '\n' && c != EOF);
   *new_buf = '\0';
   new_buf++;
   *args->data->status = args->sync->id;
