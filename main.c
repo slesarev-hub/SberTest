@@ -10,7 +10,7 @@
 
 // TODO Add history option
 // TODO Add tests
-// TODO Add shm data structure like on image here https://www.postgresql.org/docs/current/storage-page-layout.html
+// TODO Add shm data structure with data and garbage linked lists
 // TODO Destroy allocated resources
 // TODO Add memcheck test
 // TODO Catch signals
@@ -21,7 +21,7 @@
 #define SHM_DATA "/shared-data"
 
 #define SHM_META "/shared-info"
-#define SHM_META_SIZE 4
+#define SHM_META_SIZE (sizeof(int) + sizeof(size_t) + sizeof(int))
 
 #define SHM_MTX "/shm_mtx"
 #define RW_MTX1 "/rw_mtx1"
@@ -56,9 +56,15 @@ struct options {
 };
 
 struct shm_storage {
-  char *data;
-  size_t data_size;
+  char* free_space;
+  char* begin_space;
+  char* end_space;
+
+  size_t free_space_size;
+
   int* status;
+  char* first_record;
+  int* record_count;
 };
 
 struct shm_mtx {
@@ -144,26 +150,63 @@ struct interprocess_sync* shm_init_sync(char* cv_name, char* mtx_name, int id, i
   return sync;
 }
 
-char *write_line_to_shm(struct msg_handler_args* args) {
-  char *new_buf = args->storage->data;
+void move_next(struct shm_storage* storage) {
+  char* record = storage->first_record;
+  while(*record != '\0') {
+    while (*record != '\n') {
+      record++;
+      storage->free_space_size++;
+    }
+    record = *(size_t*)record;
+  }
+  record++;
+  storage->first_record = *(size_t*)record;
+  (*storage->record_count)--;
+}
+
+void write_line_to_shm(struct msg_handler_args* args) {
   while(*args->storage->status != WRITE) {}
   char c = getchar();
   pthread_mutex_lock(args->write_mtx->mtx);
   pthread_mutex_lock(args->sync->mtx->mtx);
-  do {
-    if (new_buf + 1 == args->storage->data + args->storage->data_size) {
-      error("buf");
+  struct shm_storage* storage = args->storage;
+  char* new_record_begin = storage->free_space;
+  char* new_record = storage->free_space;
+  while((c != '\n') && (c != EOF)) {
+    if (storage->free_space_size > 0) {
+      while (*new_record == '\n') {
+        new_record++;
+        new_record = *(size_t*)new_record;
+      }
+      *new_record = c;
+      new_record++;
+      storage->free_space_size--;
+    } else if (storage->record_count > 0) {
+      *new_record = '\n';
+      new_record++;
+      *(size_t*)new_record = storage->first_record;
+      new_record = storage->first_record;
+      move_next(storage);
+    } else {
+      error("too long input");
     }
-    *new_buf = c;
-    new_buf++;
-  } while((c = getchar()) != '\n' && c != EOF);
-  *new_buf = '\0';
-  new_buf++;
-  *args->storage->status = args->sync->id;
+    c = getchar();
+  }
+
+  *new_record = '\0';
+  new_record++;
+  if (storage->free_space_size > 0)//TODO проверить, что есть место на два перехода
+
+  if (storage->first_record == NULL) {
+    storage->first_record = new_record_begin;
+  }
+  (*storage->record_count)++;
+  storage->free_space = new_record;
+
+  storage->status = args->sync->id;
   pthread_cond_signal(args->sync->cv->cv);
   pthread_mutex_unlock(args->sync->mtx->mtx);
   pthread_mutex_unlock(args->write_mtx->mtx);
-  return new_buf;
 }
 
 int read_line_from_other_proc(struct msg_handler_args* args) {
@@ -185,7 +228,9 @@ void process_read(void* args) {
 
 void* process_write(void* args) {
   // printf("%d %d\n",syscall(__NR_gettid),getpid());
-  while (write_line_to_shm((struct msg_handler_args*)args)) {}
+  while (1) {
+    write_line_to_shm((struct msg_handler_args*)args);
+  }
   return NULL;
 }
 
@@ -205,11 +250,15 @@ void process_messages(struct shm_storage* storage, struct interprocess_sync* rea
 
 struct shm_storage* init_storage(char* shm_data_begin, size_t shm_data_size, char* shm_meta_begin, int flag) {
   struct shm_storage* storage = malloc(sizeof(struct shm_storage));
-  storage->data = shm_data_begin;
-  storage->data_size = shm_data_size;
+  storage->begin_space = shm_data_begin;
+  storage->end_space = shm_data_begin + shm_data_size;
   storage->status = (int*)shm_meta_begin;
+  storage->free_space = storage->begin_space;
+  storage->free_space_size = shm_data_size - 2*(sizeof(char) + sizeof(size_t));
   if (flag == CREATE_FLAG) {
     *storage->status = WRITE;
+    storage->first_record = NULL;
+    *storage->record_count = 0;
   }
   return storage;
 }
@@ -273,17 +322,19 @@ int main(int argc, char **argv) {
     if ((shm_meta_fd = shm_open(SHM_META, CREATE_FLAG, CREATE_MODE)) == -1) {
       sys_error("shm_meta_open, cannot create");
     }
-    if (ftruncate(shm_meta_fd, console_options.shm_data_size) == -1) {
+    if (ftruncate(shm_meta_fd, SHM_META_SIZE) == -1) {
       sys_error("shm_meta_open, ftruncate");
     }
+    shm_data_begin = shm_map_data_pointer(console_options.shm_data_size, shm_data_fd);
+    memset(shm_data_begin, 0, console_options.shm_data_size);
+    shm_meta_begin = shm_map_data_pointer(SHM_META_SIZE, shm_meta_fd);
+    memset(shm_meta_begin, 0, SHM_META_SIZE);
     if (sem_post(shm_mtx) == -1) {
       sys_error("sem_post, shm_mtx");
     }
     struct interprocess_sync* sync1 = shm_init_sync(RW_CV1, RW_MTX1, READ1, CREATE_FLAG, CREATE_MODE);
     struct interprocess_sync* sync2 = shm_init_sync(RW_CV2, RW_MTX2, READ2, CREATE_FLAG, CREATE_MODE);
     struct shm_mtx* w_mtx = shm_mtx_init(W_MTX, CREATE_FLAG, CREATE_MODE);
-    shm_data_begin = shm_map_data_pointer(console_options.shm_data_size, shm_data_fd);
-    shm_meta_begin = shm_map_data_pointer(SHM_META_SIZE, shm_meta_fd);
     storage = init_storage(shm_data_begin, console_options.shm_data_size, shm_meta_begin, CREATE_FLAG);
     process_messages(storage, sync1, sync2, w_mtx);
   }
