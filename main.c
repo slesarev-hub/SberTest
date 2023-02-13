@@ -8,8 +8,14 @@
 #include <pthread.h>
 #include <sys/syscall.h>
 
+// TODO Add tests
 // TODO Add shm data structure like on image here https://www.postgresql.org/docs/current/storage-page-layout.html
-// TODO destroy allocated resources
+// TODO Destroy allocated resources
+// TODO Add memcheck test
+// TODO Catch signals
+// TODO Split code into modules
+// TODO Try valgrind
+// TODO Add defrag
 
 #define SHM_DATA "/shared-data"
 
@@ -23,7 +29,7 @@
 #define RW_CV2 "/rw_cv2"
 #define W_MTX "/w_mtx"
 
-// shm status
+// shm status, stored in SHM_META
 #define READ1 1
 #define READ2 2
 #define WRITE 3
