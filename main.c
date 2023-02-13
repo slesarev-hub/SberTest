@@ -8,7 +8,14 @@
 #include <pthread.h>
 #include <sys/syscall.h>
 
-#define SHM_NAME "/shared-mem"
+// TODO Add shm data structure like on image here https://www.postgresql.org/docs/current/storage-page-layout.html
+// TODO destroy allocated resources
+
+#define SHM_DATA "/shared-data"
+
+#define SHM_META "/shared-info"
+#define SHM_META_SIZE 4
+
 #define SHM_MTX "/shm_mtx"
 #define RW_MTX1 "/rw_mtx1"
 #define RW_MTX2 "/rw_mtx2"
@@ -37,9 +44,7 @@ void error(char *msg) {
   exit(1);
 }
 
-struct shm_data {
-  char *buf;
-  size_t buf_size;
+struct shm_storage {
   char *data;
   size_t data_size;
   int* status;
@@ -64,7 +69,7 @@ struct interprocess_sync {
 };
 
 struct msg_handler_args {
-  struct shm_data* data;
+  struct shm_storage* storage;
   struct interprocess_sync* sync;
   struct shm_mtx* write_mtx;
 };
@@ -129,13 +134,13 @@ struct interprocess_sync* shm_init_sync(char* cv_name, char* mtx_name, int id, i
 }
 
 char *write_line_to_shm(struct msg_handler_args* args) {
-  char *new_buf = args->data->data;
-  while(*args->data->status != WRITE) {}
+  char *new_buf = args->storage->data;
+  while(*args->storage->status != WRITE) {}
   char c = getchar();
   pthread_mutex_lock(args->write_mtx->mtx);
   pthread_mutex_lock(args->sync->mtx->mtx);
   do {
-    if (new_buf + 1 == args->data->data + args->data->data_size) {
+    if (new_buf + 1 == args->storage->data + args->storage->data_size) {
       error("buf");
     }
     *new_buf = c;
@@ -143,7 +148,7 @@ char *write_line_to_shm(struct msg_handler_args* args) {
   } while((c = getchar()) != '\n' && c != EOF);
   *new_buf = '\0';
   new_buf++;
-  *args->data->status = args->sync->id;
+  *args->storage->status = args->sync->id;
   pthread_cond_signal(args->sync->cv->cv);
   pthread_mutex_unlock(args->sync->mtx->mtx);
   pthread_mutex_unlock(args->write_mtx->mtx);
@@ -153,60 +158,65 @@ char *write_line_to_shm(struct msg_handler_args* args) {
 int read_line_from_other_proc(struct msg_handler_args* args) {
   pthread_mutex_lock(args->sync->mtx->mtx);
 
-  while(*args->data->status != args->sync->id) {
+  while(*args->storage->status != args->sync->id) {
     pthread_cond_wait(args->sync->cv->cv, args->sync->mtx->mtx);
   }
-  printf("%s\n", args->data->data);
-  *args->data->status = WRITE;
+  printf("%s\n", args->storage->data);
+  *args->storage->status = WRITE;
   pthread_mutex_unlock(args->sync->mtx->mtx);
   return 1;
 }
 
 void process_read(void* args) {
-  printf("%d %d\n",syscall(__NR_gettid),getpid());
+  // printf("%d %d\n",syscall(__NR_gettid),getpid());
   while (read_line_from_other_proc((struct msg_handler_args*)args)) {}
 }
 
-void process_write(void* args) {
-  printf("%d %d\n",syscall(__NR_gettid),getpid());
+void* process_write(void* args) {
+  // printf("%d %d\n",syscall(__NR_gettid),getpid());
   while (write_line_to_shm((struct msg_handler_args*)args)) {}
+  return NULL;
 }
 
-void process_messages(struct shm_data* data, struct interprocess_sync* reader_sync, struct interprocess_sync* writer_sync, struct shm_mtx* write_mtx) {
+void process_messages(struct shm_storage* storage, struct interprocess_sync* reader_sync, struct interprocess_sync* writer_sync, struct shm_mtx* write_mtx) {
   struct msg_handler_args* write_args = malloc(sizeof(struct msg_handler_args));
-  write_args->data = data;
+  write_args->storage = storage;
   write_args->sync = writer_sync;  
   write_args->write_mtx = write_mtx;
   pthread_t write_thread;
   pthread_create(&write_thread, NULL, process_write, (void*)write_args);
   
   struct msg_handler_args* read_args = malloc(sizeof(struct msg_handler_args));
-  read_args->data = data;
+  read_args->storage = storage;
   read_args->sync = reader_sync;
   process_read((void*)read_args);
 }
 
-struct shm_data* init_data(char* shm_data_begin, size_t shm_data_size, int flag) {
-  struct shm_data* data = malloc(sizeof(struct shm_data));
-  data->buf = shm_data_begin;
-  data->buf_size = shm_data_size;
-  data->data = shm_data_begin + 4;
-  data->data_size = shm_data_size - 4;
-  data->status = (int*)shm_data_begin;
+struct shm_storage* init_storage(char* shm_data_begin, size_t shm_data_size, char* shm_meta_begin, int flag) {
+  struct shm_storage* storage = malloc(sizeof(struct shm_storage));
+  storage->data = shm_data_begin;
+  storage->data_size = shm_data_size;
+  storage->status = (int*)shm_meta_begin;
   if (flag == CREATE_FLAG) {
-    *data->status = WRITE;
+    *storage->status = WRITE;
   }
-  return data;
+  return storage;
 }
 
 //pthread_cond_destroy(cv.pcond);
 //pthread_condattr_destroy(&cv.attrcond); 
 
 int main(int argc, char **argv) {
-  char *shm_data_begin;
-  char *shm_data_free;
   size_t shm_data_size = 10;
-  int shm_fd;
+  
+  int shm_data_fd;
+  char *shm_data_begin;
+  
+  int shm_meta_fd;
+  char *shm_meta_begin;
+  
+  struct shm_storage* storage;
+
   sem_t *shm_mtx;
 
   if ((shm_mtx = sem_open(SHM_MTX, 0, 0, 0)) == SEM_FAILED) {
@@ -215,26 +225,40 @@ int main(int argc, char **argv) {
     }
   }
 
-  if ((shm_fd = shm_open(SHM_NAME, OPEN_FLAG, OPEN_MODE)) == -1) {
-    if ((shm_fd = shm_open(SHM_NAME, CREATE_FLAG, CREATE_MODE)) == -1) {
-      sys_error("shm_open, cannot create");
+  if ((shm_data_fd = shm_open(SHM_DATA, OPEN_FLAG, OPEN_MODE)) == -1) {
+    if ((shm_data_fd = shm_open(SHM_DATA, CREATE_FLAG, CREATE_MODE)) == -1) {
+      sys_error("shm_data_open, cannot create");
     }
-    if (ftruncate(shm_fd, shm_data_size) == -1) {
-      sys_error("ftruncate");
+    if (ftruncate(shm_data_fd, shm_data_size) == -1) {
+      sys_error("shm_data_open, ftruncate");
+    }
+    if ((shm_meta_fd = shm_open(SHM_META, CREATE_FLAG, CREATE_MODE)) == -1) {
+      sys_error("shm_meta_open, cannot create");
+    }
+    if (ftruncate(shm_meta_fd, shm_data_size) == -1) {
+      sys_error("shm_meta_open, ftruncate");
     }
     if (sem_post(shm_mtx) == -1) {
-      sys_error("sem_post: mutex_sem");
+      sys_error("sem_post, shm_mtx");
     }
     struct interprocess_sync* sync1 = shm_init_sync(RW_CV1, RW_MTX1, READ1, CREATE_FLAG, CREATE_MODE);
     struct interprocess_sync* sync2 = shm_init_sync(RW_CV2, RW_MTX2, READ2, CREATE_FLAG, CREATE_MODE);
     struct shm_mtx* w_mtx = shm_mtx_init(W_MTX, CREATE_FLAG, CREATE_MODE);
-    shm_data_begin = shm_map_data_pointer(shm_data_size, shm_fd);
-    process_messages(init_data(shm_data_begin, shm_data_size, CREATE_FLAG), sync1, sync2, w_mtx);
+    shm_data_begin = shm_map_data_pointer(shm_data_size, shm_data_fd);
+    shm_meta_begin = shm_map_data_pointer(SHM_META_SIZE, shm_meta_fd);
+    storage = init_storage(shm_data_begin, shm_data_size, shm_meta_begin, CREATE_FLAG);
+    process_messages(storage, sync1, sync2, w_mtx);
   }
 
+  // second process
+  if ((shm_meta_fd = shm_open(SHM_META, OPEN_FLAG, OPEN_MODE)) == -1) {
+    sys_error("shm_meta_open, cannot open");
+  }
+  shm_meta_begin = shm_map_data_pointer(SHM_META_SIZE, shm_meta_fd);
   struct interprocess_sync* sync1 = shm_init_sync(RW_CV1, RW_MTX1, READ1, OPEN_FLAG, OPEN_MODE);
   struct interprocess_sync* sync2 = shm_init_sync(RW_CV2, RW_MTX2, READ2, OPEN_FLAG, OPEN_MODE);
   struct shm_mtx* w_mtx = shm_mtx_init(W_MTX, OPEN_FLAG, OPEN_MODE);
-  shm_data_begin = shm_map_data_pointer(shm_data_size, shm_fd);
-  process_messages(init_data(shm_data_begin, shm_data_size, OPEN_FLAG), sync2, sync1, w_mtx);
+  shm_data_begin = shm_map_data_pointer(shm_data_size, shm_data_fd);
+  storage = init_storage(shm_data_begin, shm_data_size, shm_meta_begin, OPEN_FLAG);
+  process_messages(storage, sync2, sync1, w_mtx);
 }
