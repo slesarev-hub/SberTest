@@ -151,21 +151,16 @@ void process_write(void* args) {
 }
 
 void process_messages(struct shm_data* data, struct interprocess_sync* reader_sync, struct interprocess_sync* writer_sync, int f) {
+  struct msg_handler_args* write_args = malloc(sizeof(struct msg_handler_args));
+  write_args->data = data;
+  write_args->sync = writer_sync;  
+  pthread_t write_thread;
+  pthread_create(&write_thread, NULL, process_write, (void*)write_args);
   
-  // pthread_t write_thread;
-  // pthread_create(&write_thread, NULL, process_write, (void*)write_args);
-  if(f==1){
-    struct msg_handler_args* write_args = malloc(sizeof(struct msg_handler_args));
-    write_args->data = data;
-    write_args->sync = writer_sync;
-    process_write(write_args);
-  }
-  else {
-    struct msg_handler_args* read_args = malloc(sizeof(struct msg_handler_args));
-    read_args->data = data;
-    read_args->sync = reader_sync;
-    process_read((void*)read_args);
-  }
+  struct msg_handler_args* read_args = malloc(sizeof(struct msg_handler_args));
+  read_args->data = data;
+  read_args->sync = reader_sync;
+  process_read((void*)read_args);
 }
 
 struct shm_data* init_data(char* shm_data_begin, size_t shm_data_size) {
