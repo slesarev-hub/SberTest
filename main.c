@@ -10,10 +10,11 @@
 
 #define SHM_NAME "/shared-mem"
 #define SHM_MTX "/shm_mtx"
-#define MTX1 "/mtx1"
-#define MTX2 "/mtx2"
-#define CV1 "/cv1"
-#define CV2 "/cv2"
+#define RW_MTX1 "/rw_mtx1"
+#define RW_MTX2 "/rw_mtx2"
+#define RW_CV1 "/rw_cv1"
+#define RW_CV2 "/rw_cv2"
+#define W_MTX "/w_mtx"
 
 // shm status
 #define READ1 1
@@ -65,6 +66,7 @@ struct interprocess_sync {
 struct msg_handler_args {
   struct shm_data* data;
   struct interprocess_sync* sync;
+  struct shm_mtx* write_mtx;
 };
 
 char* shm_map_data_pointer(size_t shm_data_size, int shm_fd) {
@@ -129,6 +131,7 @@ struct interprocess_sync* shm_init_sync(char* cv_name, char* mtx_name, int id, i
 char *write_line_to_shm(struct msg_handler_args* args) {
   char *new_buf = args->data->data;
   char c = getchar();
+  pthread_mutex_lock(args->write_mtx->mtx);
   pthread_mutex_lock(args->sync->mtx->mtx);
   do {
     if (new_buf + 1 == args->data->data + args->data->data_size) {
@@ -142,6 +145,7 @@ char *write_line_to_shm(struct msg_handler_args* args) {
   *args->data->status = args->sync->id;
   pthread_cond_signal(args->sync->cv->cv);
   pthread_mutex_unlock(args->sync->mtx->mtx);
+  pthread_mutex_unlock(args->write_mtx->mtx);
   return new_buf;
 }
 
@@ -167,10 +171,11 @@ void process_write(void* args) {
   while (write_line_to_shm((struct msg_handler_args*)args)) {}
 }
 
-void process_messages(struct shm_data* data, struct interprocess_sync* reader_sync, struct interprocess_sync* writer_sync) {
+void process_messages(struct shm_data* data, struct interprocess_sync* reader_sync, struct interprocess_sync* writer_sync, struct shm_mtx* write_mtx) {
   struct msg_handler_args* write_args = malloc(sizeof(struct msg_handler_args));
   write_args->data = data;
   write_args->sync = writer_sync;  
+  write_args->write_mtx = write_mtx;
   pthread_t write_thread;
   pthread_create(&write_thread, NULL, process_write, (void*)write_args);
   
@@ -203,9 +208,6 @@ int main(int argc, char **argv) {
   int shm_fd;
   sem_t *shm_mtx;
 
-  printf("%d\n", getppid());
-  printf("%d\n", getpid());
-
   if ((shm_mtx = sem_open(SHM_MTX, 0, 0, 0)) == SEM_FAILED) {
     if ((shm_mtx = sem_open(SHM_MTX, O_CREAT, 0660, 0)) == SEM_FAILED) {
       sys_error("sem_open, cannot create");
@@ -222,14 +224,16 @@ int main(int argc, char **argv) {
     if (sem_post(shm_mtx) == -1) {
       sys_error("sem_post: mutex_sem");
     }
-    struct interprocess_sync* sync1 = shm_init_sync(CV1, MTX1, READ1, CREATE_FLAG, CREATE_MODE);
-    struct interprocess_sync* sync2 = shm_init_sync(CV2, MTX2, READ2, CREATE_FLAG, CREATE_MODE);
+    struct interprocess_sync* sync1 = shm_init_sync(RW_CV1, RW_MTX1, READ1, CREATE_FLAG, CREATE_MODE);
+    struct interprocess_sync* sync2 = shm_init_sync(RW_CV2, RW_MTX2, READ2, CREATE_FLAG, CREATE_MODE);
+    struct shm_mtx* w_mtx = shm_mtx_init(W_MTX, CREATE_FLAG, CREATE_MODE);
     shm_data_begin = shm_map_data_pointer(shm_data_size, shm_fd);
-    process_messages(init_data(shm_data_begin, shm_data_size, CREATE_FLAG), sync1, sync2);
+    process_messages(init_data(shm_data_begin, shm_data_size, CREATE_FLAG), sync1, sync2, w_mtx);
   }
 
-  struct interprocess_sync* sync1 = shm_init_sync(CV1, MTX1, READ1, OPEN_FLAG, OPEN_MODE);
-  struct interprocess_sync* sync2 = shm_init_sync(CV2, MTX2, READ2, OPEN_FLAG, OPEN_MODE);
+  struct interprocess_sync* sync1 = shm_init_sync(RW_CV1, RW_MTX1, READ1, OPEN_FLAG, OPEN_MODE);
+  struct interprocess_sync* sync2 = shm_init_sync(RW_CV2, RW_MTX2, READ2, OPEN_FLAG, OPEN_MODE);
+  struct shm_mtx* w_mtx = shm_mtx_init(W_MTX, OPEN_FLAG, OPEN_MODE);
   shm_data_begin = shm_map_data_pointer(shm_data_size, shm_fd);
-  process_messages(init_data(shm_data_begin, shm_data_size, OPEN_FLAG), sync2, sync1);
+  process_messages(init_data(shm_data_begin, shm_data_size, OPEN_FLAG), sync2, sync1, w_mtx);
 }
