@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <sys/syscall.h>
 
+// TODO Add history option
 // TODO Add tests
 // TODO Add shm data structure like on image here https://www.postgresql.org/docs/current/storage-page-layout.html
 // TODO Destroy allocated resources
@@ -49,6 +50,10 @@ void error(char *msg) {
   printf("%s\n", msg);
   exit(1);
 }
+
+struct options {
+  size_t shm_data_size;
+};
 
 struct shm_storage {
   char *data;
@@ -209,11 +214,35 @@ struct shm_storage* init_storage(char* shm_data_begin, size_t shm_data_size, cha
   return storage;
 }
 
+struct options init_default_options() {
+  struct options console_options;
+  console_options.shm_data_size = 1000;
+  return console_options;
+}
+
+struct options parse_options(int argc, char **argv, int flag) {
+  struct options console_options = init_default_options();
+  if (flag == CREATE_FLAG) {
+    int opt;
+    while ((opt = getopt(argc, argv, "s:")) != -1) {
+      switch (opt) {
+      case 's': 
+        console_options.shm_data_size = atoi(optarg);
+        break;
+      default:  
+        error("unrecognized option");
+      }
+    } 
+  } else if (getopt(argc, argv, "s") != -1) {
+    error("unrecognized option");
+  }
+}
+
 //pthread_cond_destroy(cv.pcond);
 //pthread_condattr_destroy(&cv.attrcond); 
 
 int main(int argc, char **argv) {
-  size_t shm_data_size = 10;
+  struct options console_options;
   
   int shm_data_fd;
   char *shm_data_begin;
@@ -235,13 +264,16 @@ int main(int argc, char **argv) {
     if ((shm_data_fd = shm_open(SHM_DATA, CREATE_FLAG, CREATE_MODE)) == -1) {
       sys_error("shm_data_open, cannot create");
     }
-    if (ftruncate(shm_data_fd, shm_data_size) == -1) {
+
+    console_options = parse_options(argc, argv, CREATE_FLAG);
+
+    if (ftruncate(shm_data_fd, console_options.shm_data_size) == -1) {
       sys_error("shm_data_open, ftruncate");
     }
     if ((shm_meta_fd = shm_open(SHM_META, CREATE_FLAG, CREATE_MODE)) == -1) {
       sys_error("shm_meta_open, cannot create");
     }
-    if (ftruncate(shm_meta_fd, shm_data_size) == -1) {
+    if (ftruncate(shm_meta_fd, console_options.shm_data_size) == -1) {
       sys_error("shm_meta_open, ftruncate");
     }
     if (sem_post(shm_mtx) == -1) {
@@ -250,13 +282,15 @@ int main(int argc, char **argv) {
     struct interprocess_sync* sync1 = shm_init_sync(RW_CV1, RW_MTX1, READ1, CREATE_FLAG, CREATE_MODE);
     struct interprocess_sync* sync2 = shm_init_sync(RW_CV2, RW_MTX2, READ2, CREATE_FLAG, CREATE_MODE);
     struct shm_mtx* w_mtx = shm_mtx_init(W_MTX, CREATE_FLAG, CREATE_MODE);
-    shm_data_begin = shm_map_data_pointer(shm_data_size, shm_data_fd);
+    shm_data_begin = shm_map_data_pointer(console_options.shm_data_size, shm_data_fd);
     shm_meta_begin = shm_map_data_pointer(SHM_META_SIZE, shm_meta_fd);
-    storage = init_storage(shm_data_begin, shm_data_size, shm_meta_begin, CREATE_FLAG);
+    storage = init_storage(shm_data_begin, console_options.shm_data_size, shm_meta_begin, CREATE_FLAG);
     process_messages(storage, sync1, sync2, w_mtx);
   }
 
   // second process
+
+  console_options = parse_options(argc, argv, OPEN_FLAG);
   if ((shm_meta_fd = shm_open(SHM_META, OPEN_FLAG, OPEN_MODE)) == -1) {
     sys_error("shm_meta_open, cannot open");
   }
@@ -264,7 +298,7 @@ int main(int argc, char **argv) {
   struct interprocess_sync* sync1 = shm_init_sync(RW_CV1, RW_MTX1, READ1, OPEN_FLAG, OPEN_MODE);
   struct interprocess_sync* sync2 = shm_init_sync(RW_CV2, RW_MTX2, READ2, OPEN_FLAG, OPEN_MODE);
   struct shm_mtx* w_mtx = shm_mtx_init(W_MTX, OPEN_FLAG, OPEN_MODE);
-  shm_data_begin = shm_map_data_pointer(shm_data_size, shm_data_fd);
-  storage = init_storage(shm_data_begin, shm_data_size, shm_meta_begin, OPEN_FLAG);
+  shm_data_begin = shm_map_data_pointer(console_options.shm_data_size, shm_data_fd);
+  storage = init_storage(shm_data_begin, console_options.shm_data_size, shm_meta_begin, OPEN_FLAG);
   process_messages(storage, sync2, sync1, w_mtx);
 }
