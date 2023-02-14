@@ -8,10 +8,10 @@
 #include <pthread.h>
 #include <sys/syscall.h>
 #include <string.h>
+#include <signal.h>
 
 // TODO Add history option
 // TODO Add tests
-// TODO Add shm data structure like on image here https://www.postgresql.org/docs/current/storage-page-layout.html
 // TODO Destroy allocated resources
 // TODO Add memcheck test
 // TODO Catch signals
@@ -403,6 +403,11 @@ struct options parse_options(int argc, char **argv, int flag) {
 //pthread_cond_destroy(cv.pcond);
 //pthread_condattr_destroy(&cv.attrcond); 
 
+void handle_sighup(int sig) {
+  //TODO
+  printf("got sig %d", sig);
+}
+
 int main(int argc, char **argv) {
   struct options console_options;
   
@@ -416,6 +421,8 @@ int main(int argc, char **argv) {
 
   sem_t *shm_mtx;
 
+  signal(SIGHUP, handle_sighup);
+  
   if ((shm_mtx = sem_open(SHM_MTX, 0, 0, 0)) == SEM_FAILED) {
     if ((shm_mtx = sem_open(SHM_MTX, O_CREAT, 0660, 0)) == SEM_FAILED) {
       sys_error("sem_open, cannot create");
