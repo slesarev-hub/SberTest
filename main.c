@@ -11,6 +11,7 @@
 
 // TODO Add history option
 // TODO Add tests
+// TODO Add shm data structure like on image here https://www.postgresql.org/docs/current/storage-page-layout.html
 // TODO Destroy allocated resources
 // TODO Add memcheck test
 // TODO Catch signals
