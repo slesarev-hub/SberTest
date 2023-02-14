@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/syscall.h>
+#include <string.h>
 
 // TODO Add history option
 // TODO Add tests
@@ -21,7 +22,12 @@
 #define SHM_DATA "/shared-data"
 
 #define SHM_META "/shared-info"
-#define SHM_META_SIZE (sizeof(int) + sizeof(size_t) + sizeof(int))
+
+// store record len before actual data
+#define REC_LEN 4
+// for shm_storage serialization
+// free_space_off + first_rec_off + last_rec_off + free_space_sz + total_space_sz + status + rec_cnt
+#define SHM_META_SIZE (4 + 4 + 4 + 4 + 4 + 1 + 4)
 
 #define SHM_MTX "/shm_mtx"
 #define RW_MTX1 "/rw_mtx1"
@@ -52,19 +58,19 @@ void error(char *msg) {
 }
 
 struct options {
-  size_t shm_data_size;
+  u_int32_t shm_data_size;
 };
 
 struct shm_storage {
-  char* free_space;
-  char* begin_space;
-  char* end_space;
-
-  size_t free_space_size;
-
-  int* status;
-  char* first_record;
-  int* record_count;
+  char* space_begin;
+  char* space_end;
+  u_int32_t* free_space_offset;
+  u_int32_t* first_record_offset;
+  u_int32_t* last_record_offset;
+  u_int32_t* free_space_size;
+  u_int32_t* total_space_size;
+  u_int8_t* status;
+  u_int32_t* record_count;
 };
 
 struct shm_mtx {
@@ -150,18 +156,85 @@ struct interprocess_sync* shm_init_sync(char* cv_name, char* mtx_name, int id, i
   return sync;
 }
 
-void move_next(struct shm_storage* storage) {
-  char* record = storage->first_record;
-  while(*record != '\0') {
-    while (*record != '\n') {
-      record++;
-      storage->free_space_size++;
-    }
-    record = *(size_t*)record;
+u_int32_t get_record_data_len(char* record, struct shm_storage* storage) {
+  u_int32_t len;
+  char* len_ptr = (char*)&len; 
+  if (record + 1 == storage->space_end) {
+    memcpy((void*)len_ptr, (void*)record, 1);
+    len_ptr++;
+    memcpy((void*)len_ptr, (void*)storage->space_begin, 3);
+  } else if (record + 2 == storage->space_end) {
+    memcpy((void*)len_ptr, (void*)record, 2);
+    len_ptr += 2;
+    memcpy((void*)len_ptr, (void*)storage->space_begin, 2);
+  } else if (record + 3 == storage->space_end) {
+    memcpy((void*)len_ptr, (void*)record, 3);
+    len_ptr += 3;
+    memcpy((void*)len_ptr, (void*)storage->space_begin, 1);
+  } else {
+    len = *(u_int32_t*)record;
   }
-  record++;
-  storage->first_record = *(size_t*)record;
+  return len;
+}
+
+char* get_first_record(struct shm_storage* storage) {
+  return storage->space_begin + *storage->first_record_offset;
+}
+
+void remove_last_record(struct shm_storage* storage) {
+  if (storage->record_count == 0) {
+    error("too long input");
+  }
+  char* record = get_first_record(storage);
+  u_int32_t record_len = REC_LEN + get_record_data_len(record, storage);
+  u_int32_t offset_to_end = storage->space_end - record;
+  if (offset_to_end > record_len) {
+    *storage->first_record_offset += record_len;
+  } else {
+    *storage->first_record_offset = record_len - offset_to_end;
+  }
+  *storage->free_space_size += record_len;
   (*storage->record_count)--;
+}
+
+char* get_record_data(char* record_begin, struct shm_storage* storage) {
+  if (record_begin + 1 == storage->space_end) {
+    return storage->space_begin + 3;
+  } else if (record_begin + 2 == storage->space_end) {
+    return storage->space_begin + 2;
+  } else if (record_begin + 3 == storage->space_end) {
+    return storage->space_begin + 1;
+  } else if (record_begin + 4 == storage->space_end) {
+    return storage->space_begin;
+  } else {
+    return record_begin + 4;
+  }
+}
+
+char* get_next_symbol_place(char* data, struct shm_storage* storage) {
+  if (data + 1 == storage->space_end) {
+    return storage->space_begin;
+  }
+  return ++data;
+}
+
+void write_record_len(char* record_begin, u_int32_t record_len, struct shm_storage* storage) {
+  char* len_ptr = (char*)&record_len; 
+  if (record_begin + 1 == storage->space_end) {
+    memcpy((void*)record_begin, (void*)len_ptr, 1);
+    len_ptr++;
+    memcpy((void*)storage->space_begin, (void*)len_ptr, 3);
+  } else if (record_begin + 2 == storage->space_end) {
+    memcpy((void*)record_begin, (void*)len_ptr, 2);
+    len_ptr+=2;
+    memcpy((void*)storage->space_begin, (void*)len_ptr, 2);
+  } else if (record_begin + 3 == storage->space_end) {
+    memcpy((void*)record_begin, (void*)len_ptr, 3);
+    len_ptr+=3;
+    memcpy((void*)storage->space_begin, (void*)len_ptr, 1);
+  } else {
+    *(u_int32_t*)record_begin = record_len;
+  }
 }
 
 void write_line_to_shm(struct msg_handler_args* args) {
@@ -169,54 +242,67 @@ void write_line_to_shm(struct msg_handler_args* args) {
   char c = getchar();
   pthread_mutex_lock(args->write_mtx->mtx);
   pthread_mutex_lock(args->sync->mtx->mtx);
+  
   struct shm_storage* storage = args->storage;
-  char* new_record_begin = storage->free_space;
-  char* new_record = storage->free_space;
+  char* new_record_begin = storage->space_begin + *storage->free_space_offset;
+  *storage->last_record_offset = *storage->free_space_offset;
+  u_int32_t new_record_data_len = 0;
+  if (*storage->free_space_size < REC_LEN) {
+    remove_last_record(storage);
+  }
+  char* new_record_data = get_record_data(new_record_begin, storage);
   while((c != '\n') && (c != EOF)) {
     if (storage->free_space_size > 0) {
-      while (*new_record == '\n') {
-        new_record++;
-        new_record = *(size_t*)new_record;
-      }
-      *new_record = c;
-      new_record++;
-      storage->free_space_size--;
-    } else if (storage->record_count > 0) {
-      *new_record = '\n';
-      new_record++;
-      *(size_t*)new_record = storage->first_record;
-      new_record = storage->first_record;
-      move_next(storage);
+      *new_record_data = c;
+      (*storage->free_space_size)--;
+      new_record_data = get_next_symbol_place(new_record_data, storage);
+      c = getchar();
+      new_record_data_len++;
     } else {
-      error("too long input");
+      remove_last_record(storage);
     }
-    c = getchar();
   }
-
-  *new_record = '\0';
-  new_record++;
-  if (storage->free_space_size > 0)//TODO проверить, что есть место на два перехода
-
-  if (storage->first_record == NULL) {
-    storage->first_record = new_record_begin;
+  write_record_len(new_record_begin, new_record_data_len, storage);
+  u_int32_t offset_to_end = storage->space_end - new_record_begin;
+  u_int32_t new_record_len = REC_LEN + new_record_data_len;
+  if (offset_to_end > new_record_len) {
+    *storage->free_space_offset += new_record_len;
+  } else {
+    *storage->free_space_offset = new_record_len - offset_to_end;
   }
   (*storage->record_count)++;
-  storage->free_space = new_record;
 
-  storage->status = args->sync->id;
+  *storage->status = args->sync->id;
   pthread_cond_signal(args->sync->cv->cv);
   pthread_mutex_unlock(args->sync->mtx->mtx);
   pthread_mutex_unlock(args->write_mtx->mtx);
 }
 
-int read_line_from_other_proc(struct msg_handler_args* args) {
-  pthread_mutex_lock(args->sync->mtx->mtx);
+char* get_last_record(struct shm_storage* storage) {
+  return storage->space_begin + *storage->last_record_offset;
+}
 
-  while(*args->storage->status != args->sync->id) {
+void print_record(char* record, struct shm_storage* storage) {
+  u_int32_t data_len = get_record_data_len(record, storage);
+  char* record_data = get_record_data(record, storage);
+  while(data_len > 0) {
+    printf("%c", *record_data);
+    record_data = get_next_symbol_place(record_data, storage);
+  }
+  printf("\n");
+}
+
+int read_line_from_other_proc(struct msg_handler_args* args) {
+  struct shm_storage* storage = args->storage;
+  pthread_mutex_lock(args->sync->mtx->mtx);
+  while(*storage->status != args->sync->id) {
     pthread_cond_wait(args->sync->cv->cv, args->sync->mtx->mtx);
   }
-  printf("%s\n", args->storage->data);
-  *args->storage->status = WRITE;
+  
+  char* record = get_last_record(storage);
+  print_record(record, storage);
+
+  *storage->status = WRITE;
   pthread_mutex_unlock(args->sync->mtx->mtx);
   return 1;
 }
@@ -248,16 +334,25 @@ void process_messages(struct shm_storage* storage, struct interprocess_sync* rea
   process_read((void*)read_args);
 }
 
-struct shm_storage* init_storage(char* shm_data_begin, size_t shm_data_size, char* shm_meta_begin, int flag) {
+struct shm_storage* init_storage(char* shm_data, size_t shm_data_size, char* shm_meta, int flag) {
   struct shm_storage* storage = malloc(sizeof(struct shm_storage));
-  storage->begin_space = shm_data_begin;
-  storage->end_space = shm_data_begin + shm_data_size;
-  storage->status = (int*)shm_meta_begin;
-  storage->free_space = storage->begin_space;
-  storage->free_space_size = shm_data_size - 2*(sizeof(char) + sizeof(size_t));
+  storage->space_begin = shm_data;
+  storage->space_end = shm_data + shm_data_size;
+  
+  storage->free_space_offset = (u_int32_t*)shm_meta++;
+  storage->first_record_offset = (u_int32_t*)shm_meta++;
+  storage->last_record_offset = (u_int32_t*)shm_meta++;
+  storage->free_space_size = (u_int32_t*)shm_meta++;
+  storage->total_space_size = (u_int32_t*)shm_meta++;
+  storage->status = (u_int8_t*)shm_meta++;
+  storage->record_count = (u_int32_t*)shm_meta++;
   if (flag == CREATE_FLAG) {
+    *storage->free_space_offset = 0;
+    *storage->first_record_offset = 0;
+    *storage->last_record_offset = 0;
+    *storage->free_space_size = shm_data_size;
+    *storage->total_space_size = shm_data_size;
     *storage->status = WRITE;
-    storage->first_record = NULL;
     *storage->record_count = 0;
   }
   return storage;
