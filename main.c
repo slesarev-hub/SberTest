@@ -11,7 +11,6 @@
 
 // TODO Add history option
 // TODO Add tests
-// TODO Add shm data structure with data and garbage linked lists
 // TODO Destroy allocated resources
 // TODO Add memcheck test
 // TODO Catch signals
@@ -28,6 +27,7 @@
 // for shm_storage serialization
 // free_space_off + first_rec_off + last_rec_off + free_space_sz + total_space_sz + status + rec_cnt
 #define SHM_META_SIZE (4 + 4 + 4 + 4 + 4 + 1 + 4)
+#define SHM_SZIE_OFFSET (4 + 4 + 4 + 4)
 
 #define SHM_MTX "/shm_mtx"
 #define RW_MTX1 "/rw_mtx1"
@@ -97,7 +97,7 @@ struct msg_handler_args {
   struct shm_mtx* write_mtx;
 };
 
-char* shm_map_data_pointer(size_t shm_data_size, int shm_fd) {
+char* shm_map_data_pointer(u_int32_t shm_data_size, int shm_fd) {
   char *shm_data_begin;
   if ((shm_data_begin = mmap(NULL, shm_data_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0)) == MAP_FAILED) {
     sys_error("mmap");
@@ -182,7 +182,7 @@ char* get_first_record(struct shm_storage* storage) {
 }
 
 void remove_last_record(struct shm_storage* storage) {
-  if (storage->record_count == 0) {
+  if (*storage->record_count == 0) {
     error("too long input");
   }
   char* record = get_first_record(storage);
@@ -250,9 +250,10 @@ void write_line_to_shm(struct msg_handler_args* args) {
   if (*storage->free_space_size < REC_LEN) {
     remove_last_record(storage);
   }
+  *storage->free_space_size -= REC_LEN;
   char* new_record_data = get_record_data(new_record_begin, storage);
   while((c != '\n') && (c != EOF)) {
-    if (storage->free_space_size > 0) {
+    if (*storage->free_space_size > 0) {
       *new_record_data = c;
       (*storage->free_space_size)--;
       new_record_data = get_next_symbol_place(new_record_data, storage);
@@ -288,6 +289,7 @@ void print_record(char* record, struct shm_storage* storage) {
   while(data_len > 0) {
     printf("%c", *record_data);
     record_data = get_next_symbol_place(record_data, storage);
+    data_len--;
   }
   printf("\n");
 }
@@ -334,28 +336,42 @@ void process_messages(struct shm_storage* storage, struct interprocess_sync* rea
   process_read((void*)read_args);
 }
 
-struct shm_storage* init_storage(char* shm_data, size_t shm_data_size, char* shm_meta, int flag) {
+u_int32_t get_shm_size(char* shm_meta) {
+  return *(u_int32_t*)(shm_meta + SHM_SZIE_OFFSET);
+}
+
+struct shm_storage* init_storage(char* shm_data, char* shm_meta, int flag) {
   struct shm_storage* storage = malloc(sizeof(struct shm_storage));
   storage->space_begin = shm_data;
-  storage->space_end = shm_data + shm_data_size;
   
-  storage->free_space_offset = (u_int32_t*)shm_meta++;
-  storage->first_record_offset = (u_int32_t*)shm_meta++;
-  storage->last_record_offset = (u_int32_t*)shm_meta++;
-  storage->free_space_size = (u_int32_t*)shm_meta++;
-  storage->total_space_size = (u_int32_t*)shm_meta++;
-  storage->status = (u_int8_t*)shm_meta++;
-  storage->record_count = (u_int32_t*)shm_meta++;
+  storage->free_space_offset = (u_int32_t*)shm_meta;
+  shm_meta += 4;
+  storage->first_record_offset = (u_int32_t*)shm_meta;
+  shm_meta += 4;
+  storage->last_record_offset = (u_int32_t*)shm_meta;
+  shm_meta += 4;
+  storage->free_space_size = (u_int32_t*)shm_meta;
+  shm_meta += 4;
+  storage->total_space_size = (u_int32_t*)shm_meta;
+  shm_meta += 4;
+  storage->status = (u_int8_t*)shm_meta;
+  shm_meta += 1;
+  storage->record_count = (u_int32_t*)shm_meta;
+  
+  storage->space_end = shm_data + *storage->total_space_size;
   if (flag == CREATE_FLAG) {
     *storage->free_space_offset = 0;
     *storage->first_record_offset = 0;
     *storage->last_record_offset = 0;
-    *storage->free_space_size = shm_data_size;
-    *storage->total_space_size = shm_data_size;
+    *storage->free_space_size = *storage->total_space_size;
     *storage->status = WRITE;
     *storage->record_count = 0;
   }
   return storage;
+}
+
+void init_shm_size(char* shm_meta, u_int32_t storage_size) {
+  *(u_int32_t*)(shm_meta + SHM_SZIE_OFFSET) = storage_size;
 }
 
 struct options init_default_options() {
@@ -380,6 +396,7 @@ struct options parse_options(int argc, char **argv, int flag) {
   } else if (getopt(argc, argv, "s") != -1) {
     error("unrecognized option");
   }
+  return console_options;
 }
 
 //pthread_cond_destroy(cv.pcond);
@@ -430,13 +447,16 @@ int main(int argc, char **argv) {
     struct interprocess_sync* sync1 = shm_init_sync(RW_CV1, RW_MTX1, READ1, CREATE_FLAG, CREATE_MODE);
     struct interprocess_sync* sync2 = shm_init_sync(RW_CV2, RW_MTX2, READ2, CREATE_FLAG, CREATE_MODE);
     struct shm_mtx* w_mtx = shm_mtx_init(W_MTX, CREATE_FLAG, CREATE_MODE);
-    storage = init_storage(shm_data_begin, console_options.shm_data_size, shm_meta_begin, CREATE_FLAG);
+    init_shm_size(shm_meta_begin, console_options.shm_data_size);
+    storage = init_storage(shm_data_begin, shm_meta_begin, CREATE_FLAG);
     process_messages(storage, sync1, sync2, w_mtx);
   }
 
   // second process
 
-  console_options = parse_options(argc, argv, OPEN_FLAG);
+  if (getopt(argc, argv, "s") != -1) {
+    error("this process cannot has options");
+  }
   if ((shm_meta_fd = shm_open(SHM_META, OPEN_FLAG, OPEN_MODE)) == -1) {
     sys_error("shm_meta_open, cannot open");
   }
@@ -444,7 +464,7 @@ int main(int argc, char **argv) {
   struct interprocess_sync* sync1 = shm_init_sync(RW_CV1, RW_MTX1, READ1, OPEN_FLAG, OPEN_MODE);
   struct interprocess_sync* sync2 = shm_init_sync(RW_CV2, RW_MTX2, READ2, OPEN_FLAG, OPEN_MODE);
   struct shm_mtx* w_mtx = shm_mtx_init(W_MTX, OPEN_FLAG, OPEN_MODE);
-  shm_data_begin = shm_map_data_pointer(console_options.shm_data_size, shm_data_fd);
-  storage = init_storage(shm_data_begin, console_options.shm_data_size, shm_meta_begin, OPEN_FLAG);
+  shm_data_begin = shm_map_data_pointer(get_shm_size(shm_meta_begin), shm_data_fd);
+  storage = init_storage(shm_data_begin, shm_meta_begin, OPEN_FLAG);
   process_messages(storage, sync2, sync1, w_mtx);
 }
