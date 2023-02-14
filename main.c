@@ -9,15 +9,12 @@
 #include <sys/syscall.h>
 #include <string.h>
 
-// TODO Add history option
 // TODO Add tests
-// TODO Add shm data structure like on image here https://www.postgresql.org/docs/current/storage-page-layout.html
 // TODO Destroy allocated resources
 // TODO Add memcheck test
 // TODO Catch signals
 // TODO Split code into modules
 // TODO Try valgrind
-// TODO Add defrag
 
 #define SHM_DATA "/shared-data"
 
@@ -238,12 +235,36 @@ void write_record_len(char* record_begin, u_int32_t record_len, struct shm_stora
   }
 }
 
-void write_line_to_shm(struct msg_handler_args* args) {
-  while(*args->storage->status != WRITE) {}
-  char c = getchar();
-  pthread_mutex_lock(args->write_mtx->mtx);
-  pthread_mutex_lock(args->sync->mtx->mtx);
-  
+char* get_next_record(char* record, struct shm_storage* storage) {
+  u_int32_t record_len = REC_LEN + get_record_data_len(record, storage);
+  u_int32_t offset_to_end = storage->space_end - record;
+  if (record_len < offset_to_end) {
+    return record + record_len;
+  }
+  return storage->space_begin + (record_len - offset_to_end);
+}
+
+void print_record(char* record, struct shm_storage* storage) {
+  u_int32_t data_len = get_record_data_len(record, storage);
+  char* record_data = get_record_data(record, storage);
+  while(data_len > 0) {
+    printf("%c", *record_data);
+    record_data = get_next_symbol_place(record_data, storage);
+    data_len--;
+  }
+  printf("\n");
+}
+
+void print_history(struct shm_storage* storage) {
+  char* record = get_first_record(storage);
+  printf("Histoy:\n");
+  for(int i = 0; i < *storage->record_count; i++) {
+    print_record(record, storage);
+    record = get_next_record(record, storage);
+  }
+}
+
+void write_line_to_shm(struct msg_handler_args* args, char fst_symbol, char snd_symbol) {
   struct shm_storage* storage = args->storage;
   char* new_record_begin = storage->space_begin + *storage->free_space_offset;
   *storage->last_record_offset = *storage->free_space_offset;
@@ -253,6 +274,18 @@ void write_line_to_shm(struct msg_handler_args* args) {
   }
   *storage->free_space_size -= REC_LEN;
   char* new_record_data = get_record_data(new_record_begin, storage);
+  
+  char c = fst_symbol;
+  if (*storage->free_space_size > 0) {
+    *new_record_data = c;
+    (*storage->free_space_size)--;
+    new_record_data = get_next_symbol_place(new_record_data, storage);
+    new_record_data_len++;
+  } else {
+    remove_last_record(storage);
+  }
+  
+  c = snd_symbol;
   while((c != '\n') && (c != EOF)) {
     if (*storage->free_space_size > 0) {
       *new_record_data = c;
@@ -276,23 +309,29 @@ void write_line_to_shm(struct msg_handler_args* args) {
 
   *storage->status = args->sync->id;
   pthread_cond_signal(args->sync->cv->cv);
+}
+
+void read_line_from_console(struct msg_handler_args* args) {
+  while(*args->storage->status != WRITE) {}
+  char fst_symbol = getchar();
+  pthread_mutex_lock(args->write_mtx->mtx);
+  pthread_mutex_lock(args->sync->mtx->mtx);
+  char snd_symbol = getchar(); 
+  
+  struct shm_storage* storage = args->storage;
+
+  if ((fst_symbol == 'h' || fst_symbol == 'H') && (snd_symbol == '\n')) {
+    print_history(storage);
+  } else {
+    write_line_to_shm(args, fst_symbol, snd_symbol);
+  }
+
   pthread_mutex_unlock(args->sync->mtx->mtx);
   pthread_mutex_unlock(args->write_mtx->mtx);
 }
 
 char* get_last_record(struct shm_storage* storage) {
   return storage->space_begin + *storage->last_record_offset;
-}
-
-void print_record(char* record, struct shm_storage* storage) {
-  u_int32_t data_len = get_record_data_len(record, storage);
-  char* record_data = get_record_data(record, storage);
-  while(data_len > 0) {
-    printf("%c", *record_data);
-    record_data = get_next_symbol_place(record_data, storage);
-    data_len--;
-  }
-  printf("\n");
 }
 
 int read_line_from_other_proc(struct msg_handler_args* args) {
@@ -318,7 +357,7 @@ void process_read(void* args) {
 void* process_write(void* args) {
   // printf("%d %d\n",syscall(__NR_gettid),getpid());
   while (1) {
-    write_line_to_shm((struct msg_handler_args*)args);
+    read_line_from_console((struct msg_handler_args*)args);
   }
   return NULL;
 }
