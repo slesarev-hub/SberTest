@@ -276,14 +276,14 @@ void write_line_to_shm(struct msg_handler_args* args, char fst_symbol, char snd_
   char* new_record_data = get_record_data(new_record_begin, storage);
   
   char c = fst_symbol;
-  if (*storage->free_space_size > 0) {
-    *new_record_data = c;
-    (*storage->free_space_size)--;
-    new_record_data = get_next_symbol_place(new_record_data, storage);
-    new_record_data_len++;
-  } else {
+
+  if (*storage->free_space_size == 0) {
     remove_last_record(storage);
   }
+  *new_record_data = c;
+  (*storage->free_space_size)--;
+  new_record_data = get_next_symbol_place(new_record_data, storage);
+  new_record_data_len++;
   
   c = snd_symbol;
   while((c != '\n') && (c != EOF)) {
